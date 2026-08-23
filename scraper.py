@@ -1,76 +1,77 @@
 import os
-import re
-from datetime import datetime
-from bs4 import BeautifulSoup
-from curl_cffi import requests
+import requests
 import pandas as pd
+from datetime import datetime
 
-URL = "https://tibiavip.app/houses?status=auctioned&type=&world=Antica&auction=&town="
+WORLD = "Antica"
 CSV_FILE = "historia_licytacji.csv"
 
-def parse_bid_status(status_text: str, link_tag=None):
-    clean_text = " ".join(status_text.split())
+TOWNS = [
+    "Ab'Dendriel", "Ankrahmun", "Carlin", "Darashia", "Edron", 
+    "Farmine", "Gray Beach", "Issavi", "Kazordoon", "Liberty Bay", 
+    "Moonfall", "Port Hope", "Rathleton", "Silvertides", "Svargrond", 
+    "Thais", "Venore", "Yalahar"
+]
+
+def get_auctioned_houses():
+    auctioned = []
     
-    gold_match = re.search(r"([\d\s,\.]+)\s*gold", clean_text, re.IGNORECASE)
-    if gold_match:
-        gold_str = re.sub(r"[^\d]", "", gold_match.group(1))
-        gold_amount = int(gold_str) if gold_str else 0
-    else:
-        gold_amount = 0
-
-    player_nick = "Brak ofert"
-    if link_tag and link_tag.get_text(strip=True):
-        player_nick = link_tag.get_text(strip=True)
-    else:
-        nick_match = re.search(r"by\s+([A-Za-z0-9'\-\s]+?)(?:\)|$|,)", clean_text, re.IGNORECASE)
-        if nick_match:
-            player_nick = nick_match.group(1).strip()
-
-    return player_nick, gold_amount
+    for town in TOWNS:
+        url = f"https://api.tibiadata.com/v4/houses/{WORLD}/{town}"
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code != 200:
+                continue
+            
+            data = resp.json()
+            house_list = data.get("houses", {}).get("house_list", [])
+            
+            for h in house_list:
+                status = h.get("status", "")
+                
+                # Interesują nas tylko domki licytowane (auctioned)
+                if status == "auctioned":
+                    auction_info = h.get("auction", {})
+                    
+                    current_bid = auction_info.get("current_bid", 0)
+                    bidder = auction_info.get("current_bidder", "Brak ofert")
+                    if not bidder:
+                        bidder = "Brak ofert"
+                    
+                    auctioned.append({
+                        "Timestamp_UTC": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                        "World": WORLD,
+                        "House Name": h.get("name"),
+                        "Town": town,
+                        "Size (SQM)": h.get("size"),
+                        "Rent (Gold)": h.get("rent"),
+                        "Player Nick": bidder,
+                        "Gold Amount": current_bid
+                    })
+        except Exception as e:
+            print(f"Błąd przy pobieraniu miasta {town}: {e}")
+            
+    return auctioned
 
 def main():
-    print(f"Pobieranie danych z: {URL}")
-    resp = requests.get(URL, impersonate="chrome120", timeout=25)
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, 'html.parser')
-    table = soup.find('table')
-    if not table:
-        print("Nie znaleziono tabeli.")
+    print(f"Pobieranie licytacji ze świata {WORLD}...")
+    records = get_auctioned_houses()
+    
+    if not records:
+        print("Brak trwających licytacji w tym momencie.")
         return
 
-    now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-    current_records = []
+    df_new = pd.DataFrame(records)
+    print(f"\nZnaleziono {len(df_new)} licytowanych domków:")
+    print(df_new[["House Name", "Town", "Player Nick", "Gold Amount"]].to_string(index=False))
 
-    for row in table.find_all('tr')[1:]:
-        cols = row.find_all('td')
-        if len(cols) >= 3:
-            house_name = cols[0].get_text(strip=True)
-            town = cols[1].get_text(strip=True)
-            bid_col = cols[-1]
-
-            nick, gold = parse_bid_status(bid_col.get_text(strip=True), bid_col.find('a'))
-
-            current_records.append({
-                "Timestamp_UTC": now_str,
-                "House Name": house_name,
-                "Town": town,
-                "Player Nick": nick,
-                "Gold Amount": gold
-            })
-
-    if not current_records:
-        print("Brak domków na licytacji.")
-        return
-
-    df_new = pd.DataFrame(current_records)
-
+    # Zapis i dopisywanie do pliku CSV
     if os.path.exists(CSV_FILE):
-        df_new.to_csv(CSV_FILE, mode='a', header=False, index=False)
+        df_new.to_csv(CSV_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
     else:
-        df_new.to_csv(CSV_FILE, mode='w', header=True, index=False)
+        df_new.to_csv(CSV_FILE, mode='w', header=True, index=False, encoding='utf-8-sig')
 
-    print(f"Pomyślnie zaktualizowano {CSV_FILE} o {len(df_new)} rekordów.")
+    print(f"\n[+] Pomyślnie zaktualizowano {CSV_FILE}!")
 
 if __name__ == "__main__":
     main()
