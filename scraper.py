@@ -29,14 +29,11 @@ def get_auctioned_houses():
             for h in house_list:
                 status = h.get("status", "")
                 
-                # Interesują nas tylko domki licytowane (auctioned)
+                # Domki licytowane
                 if status == "auctioned":
                     auction_info = h.get("auction", {})
-                    
                     current_bid = auction_info.get("current_bid", 0)
-                    bidder = auction_info.get("current_bidder", "Brak ofert")
-                    if not bidder:
-                        bidder = "Brak ofert"
+                    bidder = auction_info.get("current_bidder") or "Brak ofert"
                     
                     auctioned.append({
                         "Timestamp_UTC": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
@@ -57,21 +54,23 @@ def main():
     print(f"Pobieranie licytacji ze świata {WORLD}...")
     records = get_auctioned_houses()
     
-    if not records:
-        print("Brak trwających licytacji w tym momencie.")
-        return
+    if records:
+        df_new = pd.DataFrame(records)
+        print(f"\nZnaleziono {len(df_new)} licytowanych domków:")
+        print(df_new[["House Name", "Town", "Player Nick", "Gold Amount"]].to_string(index=False))
 
-    df_new = pd.DataFrame(records)
-    print(f"\nZnaleziono {len(df_new)} licytowanych domków:")
-    print(df_new[["House Name", "Town", "Player Nick", "Gold Amount"]].to_string(index=False))
-
-    # Zapis i dopisywanie do pliku CSV
-    if os.path.exists(CSV_FILE):
-        df_new.to_csv(CSV_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
+        if os.path.exists(CSV_FILE):
+            df_new.to_csv(CSV_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
+        else:
+            df_new.to_csv(CSV_FILE, mode='w', header=True, index=False, encoding='utf-8-sig')
     else:
-        df_new.to_csv(CSV_FILE, mode='w', header=True, index=False, encoding='utf-8-sig')
+        print("Brak trwających licytacji w tej chwili.")
+        # Jeśli plik jeszcze w ogóle nie istnieje, twórz pusty szablon z nagłówkami
+        if not os.path.exists(CSV_FILE):
+            cols = ["Timestamp_UTC", "World", "House Name", "Town", "Size (SQM)", "Rent (Gold)", "Player Nick", "Gold Amount"]
+            pd.DataFrame(columns=cols).to_csv(CSV_FILE, index=False, encoding='utf-8-sig')
 
-    print(f"\n[+] Pomyślnie zaktualizowano {CSV_FILE}!")
+    print(f"[+] Plik {CSV_FILE} jest gotowy.")
 
 if __name__ == "__main__":
     main()
