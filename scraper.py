@@ -1,9 +1,8 @@
 import os
-import re
+import urllib.parse
 from datetime import datetime
-from bs4 import BeautifulSoup
-from curl_cffi import requests
 import pandas as pd
+import requests
 
 WORLD = "Antica"
 CSV_FILE = "historia_licytacji.csv"
@@ -15,101 +14,80 @@ TOWNS = [
     "Venore", "Yalahar"
 ]
 
-def parse_auction_cell(cell_text):
-    clean = " ".join(cell_text.split())
-    
-    gold_match = re.search(r"([\d\s,\.]+)\s*gold", clean, re.IGNORECASE)
-    gold_amount = 0
-    if gold_match:
-        gold_str = re.sub(r"[^\d]", "", gold_match.group(1))
-        gold_amount = int(gold_str) if gold_str else 0
-        
-    player_nick = None
-    nick_match = re.search(r"by\s+([A-Za-z0-9'\-\s]+?)(?:\)|$|,)", clean, re.IGNORECASE)
-    if nick_match:
-        player_nick = nick_match.group(1).strip()
-        
-    return player_nick, gold_amount
-
-def scrape_tibia_com():
+def get_auctioned_bids():
     bids = []
     now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-    post_url = "https://www.tibia.com/community/?subtopic=houses"
+    headers = {"User-Agent": "TibiaAuctionTracker/1.0"}
 
-    print(f"--- Skanowanie Tibia.com formularzem POST dla świata: {WORLD} ---")
+    print(f"--- Skanowanie licytacji na świecie: {WORLD} ---")
 
     for town in TOWNS:
-        # Formularz Tibia.com wymaga dokładnie tych pól w zapytaniu POST
-        payload = {
-            "world": WORLD,
-            "town": town,
-            "state": "auctioned",
-            "type": "houses",
-            "order": "name"
-        }
+        town_encoded = urllib.parse.quote(town)
+        url = f"https://api.tibiadata.com/v4/houses/{WORLD}/{town_encoded}"
 
         try:
-            resp = requests.post(
-                post_url,
-                data=payload,
-                impersonate="chrome120",
-                timeout=25
-            )
-            
+            resp = requests.get(url, headers=headers, timeout=15)
             if resp.status_code != 200:
-                print(f"[{town}] Błąd HTTP {resp.status_code}")
                 continue
 
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            
-            # Wyszukujemy wszystkie tabele z danymi domków
-            rows = soup.find_all("tr")
-            town_bids = 0
+            data = resp.json()
+            houses_data = data.get("houses", {})
+            house_list = (houses_data.get("house_list") or []) + (houses_data.get("guildhall_list") or [])
 
-            for row in rows:
-                cols = row.find_all("td")
-                if len(cols) >= 4:
-                    house_name = cols[0].get_text(strip=True)
-                    status_text = cols[3].get_text(strip=True)
+            for h in house_list:
+                status = str(h.get("status", "")).lower()
+                is_auctioned = h.get("auctioned") is True or "auction" in status
+                
+                # Jeśli domek jest na aukcji, pobieramy jego pełną kartę
+                if is_auctioned:
+                    house_id = h.get("house_id")
+                    house_name = h.get("name", "N/A")
 
-                    # Sprawdzamy czy wiersz ma licytację i ofertę gracza (słowo 'by')
-                    if "auction" in status_text.lower() and "by" in status_text.lower():
-                        player_nick, gold_amount = parse_auction_cell(status_text)
-                        
-                        if player_nick and gold_amount > 0:
-                            print(f"  [+] {house_name} ({town}) -> Nick: {player_nick} | Oferta: {gold_amount} gp")
+                    if not house_id:
+                        continue
+
+                    # Pobieranie szczegółów aukcji konkretnego domku
+                    detail_url = f"https://api.tibiadata.com/v4/house/{WORLD}/{house_id}"
+                    d_resp = requests.get(detail_url, headers=headers, timeout=15)
+                    
+                    if d_resp.status_code == 200:
+                        house_details = d_resp.json().get("house", {})
+                        auction_info = house_details.get("auction", {})
+
+                        player_nick = auction_info.get("current_bidder")
+                        gold_bid = auction_info.get("current_bid", 0)
+
+                        # Filtrujemy tylko oferty ze złożonym bidem gracza
+                        if player_nick and int(gold_bid) > 0:
+                            print(f"  [+] {house_name} ({town}) -> Gracz: {player_nick} | Oferta: {gold_bid} gp")
                             bids.append({
                                 "Timestamp_UTC": now_str,
                                 "House Name": house_name,
                                 "Town": town,
-                                "Player Nick": player_nick,
-                                "Gold Amount": gold_amount
+                                "Player Nick": player_nick.strip(),
+                                "Gold Amount": int(gold_bid)
                             })
-                            town_bids += 1
-                            
-            print(f"[{town}] Zakończono, znaleziono aktywnych ofert: {town_bids}")
-
         except Exception as e:
             print(f"[{town}] Błąd: {e}")
 
     return bids
 
 def main():
-    records = scrape_tibia_com()
-    
+    records = get_auctioned_bids()
+
     if records:
         df_new = pd.DataFrame(records)
         print(f"\n==========================================")
-        print(f"Sukces! Pobrano łącznie {len(df_new)} ofert z Tibia.com.")
+        print(f"Pobrano łącznie {len(df_new)} aktywnych licytacji z ofertami.")
         print(f"==========================================")
-        
+
         if os.path.exists(CSV_FILE):
             df_new.to_csv(CSV_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
         else:
             df_new.to_csv(CSV_FILE, mode='w', header=True, index=False, encoding='utf-8-sig')
-        print(f"[+] Zaktualizowano plik {CSV_FILE}.")
+        print(f"[+] Zapisano w {CSV_FILE}.")
     else:
-        print("\n[i] Brak licytacji z aktywnymi ofertami graczy.")
+        print("\n[i] Brak ofert w tej chwili na Antice.")
         if not os.path.exists(CSV_FILE):
             cols = ["Timestamp_UTC", "House Name", "Town", "Player Nick", "Gold Amount"]
             pd.DataFrame(columns=cols).to_csv(CSV_FILE, index=False, encoding='utf-8-sig')
