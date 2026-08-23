@@ -1,79 +1,34 @@
-import os
-import re
-from datetime import datetime
-from bs4 import BeautifulSoup
-from curl_cffi import requests
-import pandas as pd
+name: Tibia House Scraper
 
-URL = "https://tibiavip.app/houses?status=auctioned&type=&world=Antica&auction=&town="
-CSV_FILE = "historia_licytacji.csv"
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
 
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Pobierz kod repozytorium
+        uses: actions/checkout@v4
 
-def parse_bid_status(status_text: str, link_tag=None):
-  clean_text = " ".join(status_text.split())
-  gold_match = re.search(r"([\d\s,\.]+)\s*gold", clean_text, re.IGNORECASE)
-  gold_amount = (
-      re.sub(r"[^\d]", "", gold_match.group(1)) if gold_match else "0"
-  )
+      - name: Konfiguracja Pythona
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-  player_nick = "Brak ofert"
-  if link_tag and link_tag.get_text(strip=True):
-    player_nick = link_tag.get_text(strip=True)
-  else:
-    nick_match = re.search(
-        r"by\s+([A-Za-z0-9'\-\s]+?)(?:\)|$|,)", clean_text, re.IGNORECASE
-    )
-    if nick_match:
-      player_nick = nick_match.group(1).strip()
+      - name: Instalacja bibliotek
+        run: pip install curl_cffi beautifulsoup4 pandas
 
-  return player_nick, gold_amount
+      - name: Uruchomienie skryptu
+        run: python scraper.py
 
-
-def main():
-  # impersonate="chrome120" omija blokady Cloudflare / 403
-  resp = requests.get(URL, impersonate="chrome120", timeout=20)
-  resp.raise_for_status()
-
-  soup = BeautifulSoup(resp.text, "html.parser")
-  table = soup.find("table")
-  if not table:
-    print("Nie znaleziono tabeli.")
-    return
-
-  now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-  new_records = []
-
-  for row in table.find_all("tr")[1:]:
-    cols = row.find_all("td")
-    if len(cols) >= 3:
-      house_name = cols[0].get_text(strip=True)
-      town = cols[1].get_text(strip=True)
-      bid_col = cols[-1]
-      nick, gold = parse_bid_status(
-          bid_col.get_text(strip=True), bid_col.find("a")
-      )
-
-      new_records.append({
-          "Timestamp_UTC": now_str,
-          "House Name": house_name,
-          "Town": town,
-          "Player Nick": nick,
-          "Gold Amount": gold,
-      })
-
-  if not new_records:
-    print("Brak rekordów do zapisania.")
-    return
-
-  df_new = pd.DataFrame(new_records)
-
-  if os.path.exists(CSV_FILE):
-    df_new.to_csv(CSV_FILE, mode="a", header=False, index=False)
-  else:
-    df_new.to_csv(CSV_FILE, mode="w", header=True, index=False)
-
-  print(f"Pomyślnie dodano {len(df_new)} wierszy do {CSV_FILE}.")
-
-
-if __name__ == "__main__":
-  main()
+      - name: Zapisanie pliku CSV w repozytorium
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add historia_licytacji.csv
+          git commit -m "Aktualizacja licytacji: $(date)" || exit 0
+          git push
