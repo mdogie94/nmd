@@ -2,6 +2,9 @@ name: Tibia House Scraper
 
 on:
   schedule:
+    # 1. Tryb Snajpera: 07:55 UTC (09:55 CEST) do 10:00:05
+    - cron: '55 7 * * *'
+    # 2. Standardowy monitoring co godzinę
     - cron: '0 * * * *'
   workflow_dispatch:
 
@@ -30,5 +33,6 @@ jobs:
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           git add -A
-          git commit -m "Aktualizacja licytacji: $(date)" || exit 0
-          git push
+          git diff-index --quiet HEAD || git commit -m "Aktualizacja licytacji: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git pull --rebase origin main
+          git push origin main
