@@ -6,15 +6,41 @@ from datetime import datetime
 WORLD = "Antica"
 CSV_FILE = "historia_licytacji.csv"
 
+# Kompletna lista wszystkich miast w Tibii z domkami i guildhallami
 TOWNS = [
-    "Ab'Dendriel", "Ankrahmun", "Carlin", "Darashia", "Edron", 
-    "Farmine", "Gray Beach", "Issavi", "Kazordoon", "Liberty Bay", 
-    "Moonfall", "Port Hope", "Rathleton", "Silvertides", "Svargrond", 
-    "Thais", "Venore", "Yalahar"
+    "Ab'Dendriel",
+    "Ankrahmun",
+    "Bounac",
+    "Carlin",
+    "Cormaya",
+    "Darashia",
+    "Edron",
+    "Farmine",
+    "Fibula",
+    "Gnomprona",
+    "Gray Beach",
+    "Issavi",
+    "Kazordoon",
+    "Liberty Bay",
+    "Marapur",
+    "Moonfall",
+    "Outlaw Camp",
+    "Port Hope",
+    "Rathleton",
+    "Roshamuul",
+    "Silvertides",
+    "Svargrond",
+    "Thais",
+    "Venore",
+    "Waterfall",
+    "Yalahar"
 ]
 
-def get_auctioned_houses():
-    auctioned = []
+def get_all_bids():
+    bids = []
+    now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    
+    print(f"Pobieranie listy domków dla świata: {WORLD}...")
     
     for town in TOWNS:
         url = f"https://api.tibiadata.com/v4/houses/{WORLD}/{town}"
@@ -27,50 +53,61 @@ def get_auctioned_houses():
             house_list = data.get("houses", {}).get("house_list", [])
             
             for h in house_list:
-                status = h.get("status", "")
+                status = str(h.get("status", "")).lower()
                 
-                # Domki licytowane
-                if status == "auctioned":
-                    auction_info = h.get("auction", {})
-                    current_bid = auction_info.get("current_bid", 0)
-                    bidder = auction_info.get("current_bidder") or "Brak ofert"
+                # Szukamy domków wystawionych na licytację
+                if "auction" in status:
+                    house_id = h.get("house_id")
+                    house_name = h.get("name", "N/A")
                     
-                    auctioned.append({
-                        "Timestamp_UTC": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                    player_nick = "Brak ofert"
+                    gold_amount = 0
+                    
+                    # Odpytanie o szczegóły konkretnej licytacji (cena + nick)
+                    if house_id:
+                        try:
+                            detail_url = f"https://api.tibiadata.com/v4/house/{WORLD}/{house_id}"
+                            d_resp = requests.get(detail_url, timeout=10)
+                            if d_resp.status_code == 200:
+                                d_json = d_resp.json().get("house", {})
+                                auction_data = d_json.get("auction", {})
+                                
+                                gold_amount = auction_data.get("current_bid", 0)
+                                player_nick = auction_data.get("current_bidder") or "Brak ofert"
+                        except Exception as ex:
+                            print(f"Nie udało się pobrać szczegółów dla domku {house_name}: {ex}")
+                    
+                    print(f"-> Znaleziono: {house_name} ({town}) | {player_nick} | {gold_amount} gold")
+                    
+                    bids.append({
+                        "Timestamp_UTC": now_str,
                         "World": WORLD,
-                        "House Name": h.get("name"),
+                        "House Name": house_name,
                         "Town": town,
-                        "Size (SQM)": h.get("size"),
-                        "Rent (Gold)": h.get("rent"),
-                        "Player Nick": bidder,
-                        "Gold Amount": current_bid
+                        "Size (SQM)": h.get("size", "N/A"),
+                        "Rent (Gold)": h.get("rent", "N/A"),
+                        "Player Nick": player_nick,
+                        "Gold Amount": gold_amount
                     })
         except Exception as e:
-            print(f"Błąd przy pobieraniu miasta {town}: {e}")
+            print(f"Błąd dla miasta {town}: {e}")
             
-    return auctioned
+    return bids
 
 def main():
-    print(f"Pobieranie licytacji ze świata {WORLD}...")
-    records = get_auctioned_houses()
+    records = get_all_bids()
     
     if records:
         df_new = pd.DataFrame(records)
-        print(f"\nZnaleziono {len(df_new)} licytowanych domków:")
-        print(df_new[["House Name", "Town", "Player Nick", "Gold Amount"]].to_string(index=False))
-
+        print(f"\n[+] Znaleziono łącznie {len(df_new)} licytacji.")
+        
         if os.path.exists(CSV_FILE):
             df_new.to_csv(CSV_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
         else:
             df_new.to_csv(CSV_FILE, mode='w', header=True, index=False, encoding='utf-8-sig')
+        print(f"[+] Zaktualizowano plik {CSV_FILE}.")
     else:
-        print("Brak trwających licytacji w tej chwili.")
-        # Jeśli plik jeszcze w ogóle nie istnieje, twórz pusty szablon z nagłówkami
-        if not os.path.exists(CSV_FILE):
-            cols = ["Timestamp_UTC", "World", "House Name", "Town", "Size (SQM)", "Rent (Gold)", "Player Nick", "Gold Amount"]
-            pd.DataFrame(columns=cols).to_csv(CSV_FILE, index=False, encoding='utf-8-sig')
-
-    print(f"[+] Plik {CSV_FILE} jest gotowy.")
+        print("\n[!] W tym momencie żaden domek nie jest licytowany na Antice.")
 
 if __name__ == "__main__":
     main()
