@@ -2,13 +2,10 @@ import os
 import re
 from datetime import datetime
 from bs4 import BeautifulSoup
+from curl_cffi import requests
 import pandas as pd
-import requests
 
 URL = "https://tibiavip.app/houses?status=auctioned&type=&world=Antica&auction=&town="
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-}
 CSV_FILE = "historia_licytacji.csv"
 
 
@@ -33,8 +30,10 @@ def parse_bid_status(status_text: str, link_tag=None):
 
 
 def main():
-  resp = requests.get(URL, headers=HEADERS, timeout=15)
+  # impersonate="chrome120" omija blokady Cloudflare / 403
+  resp = requests.get(URL, impersonate="chrome120", timeout=20)
   resp.raise_for_status()
+
   soup = BeautifulSoup(resp.text, "html.parser")
   table = soup.find("table")
   if not table:
@@ -73,7 +72,7 @@ def main():
   else:
     df_new.to_csv(CSV_FILE, mode="w", header=True, index=False)
 
-  print(f"Zapisano {len(df_new)} wierszy.")
+  print(f"Pomyślnie dodano {len(df_new)} wierszy do {CSV_FILE}.")
 
 
 if __name__ == "__main__":
