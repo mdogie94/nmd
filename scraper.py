@@ -1,6 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 import os
 import urllib.parse
-from datetime import datetime
 import pandas as pd
 import requests
 
@@ -27,97 +28,114 @@ TOWNS = [
     "Yalahar",
 ]
 
+HEADERS = {"User-Agent": "TibiaAuctionTracker/1.0"}
+
+
+def fetch_town_houses(town):
+  town_encoded = urllib.parse.quote(town)
+  url = f"https://api.tibiadata.com/v4/houses/{WORLD}/{town_encoded}"
+  try:
+    resp = requests.get(url, headers=HEADERS, timeout=10)
+    if resp.status_code == 200:
+      data = resp.json().get("houses", {})
+      return (data.get("house_list") or []) + (
+          data.get("guildhall_list") or []
+      )
+  except Exception:
+    pass
+  return []
+
+
+def check_single_house(h, town, now_str):
+  house_id = h.get("house_id")
+  house_name = h.get("name", "N/A")
+
+  if not house_id:
+    return None
+
+  try:
+    detail_url = f"https://api.tibiadata.com/v4/house/{WORLD}/{house_id}"
+    resp = requests.get(detail_url, headers=HEADERS, timeout=6)
+
+    if resp.status_code == 200:
+      house_data = resp.json().get("house", {})
+      status_obj = house_data.get("status", {})
+      auction_obj = (
+          house_data.get("auction") or status_obj.get("auction") or {}
+      )
+
+      player_nick = (
+          auction_obj.get("current_bidder")
+          or auction_obj.get("bidder")
+          or status_obj.get("current_bidder")
+          or status_obj.get("highest_bidder")
+      )
+
+      gold_bid = (
+          auction_obj.get("current_bid")
+          or auction_obj.get("bid")
+          or status_obj.get("current_bid")
+          or status_obj.get("highest_bid")
+          or 0
+      )
+
+      if player_nick and str(player_nick).strip() not in [
+          "",
+          "None",
+          "null",
+          "Brak ofert",
+      ]:
+        print(
+            f"  [+] Trafiono: {house_name} ({town}) | Gracz: {player_nick} |"
+            f" {gold_bid} gp",
+            flush=True,
+        )
+        return {
+            "Timestamp_UTC": now_str,
+            "House Name": house_name,
+            "Town": town,
+            "Player Nick": str(player_nick).strip(),
+            "Gold Amount": int(gold_bid),
+        }
+  except Exception:
+    pass
+  return None
+
 
 def get_all_bids():
   bids = []
   now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-  headers = {
-      "User-Agent": (
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      )
-  }
 
   print(
-      f"--- Rozpoczynam pełne skanowanie licytacji dla świata: {WORLD} ---"
+      f"--- Szybkie skanowanie licytacji dla świata: {WORLD} ---", flush=True
   )
 
+  # Krok 1: Pobieramy listę domków ze wszystkich miast
+  houses_to_check = []
   for town in TOWNS:
-    town_encoded = urllib.parse.quote(town)
-    url = f"https://api.tibiadata.com/v4/houses/{WORLD}/{town_encoded}"
+    houses = fetch_town_houses(town)
+    for h in houses:
+      status = str(h.get("status", "")).lower()
+      # Sprawdzamy tylko te, które nie są wynajęte
+      if status not in ["rented", "rented (transfer)", "rented (moving)"]:
+        houses_to_check.append((h, town))
 
-    try:
-      resp = requests.get(url, headers=headers, timeout=20)
-      if resp.status_code != 200:
-        continue
+  print(
+      f"Znaleziono {len(houses_to_check)} potencjalnych domków. Sprawdzam"
+      " równolegle...",
+      flush=True,
+  )
 
-      data = resp.json()
-      houses_obj = data.get("houses", {})
-      house_list = (houses_obj.get("house_list") or []) + (
-          houses_obj.get("guildhall_list") or []
-      )
-
-      for h in house_list:
-        house_id = h.get("house_id")
-        status = str(h.get("status", "")).lower()
-
-        # Pomijamy tylko domki definitywnie wynajęte
-        if status in ["rented", "rented (transfer)", "rented (moving)"]:
-          continue
-
-        if not house_id:
-          continue
-
-        # Odpytujemy o szczegóły domku
-        detail_url = f"https://api.tibiadata.com/v4/house/{WORLD}/{house_id}"
-        d_resp = requests.get(detail_url, headers=headers, timeout=15)
-
-        if d_resp.status_code == 200:
-          house_data = d_resp.json().get("house", {})
-          status_detail = house_data.get("status", {})
-          auction_data = (
-              house_data.get("auction")
-              or status_detail.get("auction")
-              or {}
-          )
-
-          # Pobieramy nick i kwotę z różnych możliwych struktur API
-          player_nick = (
-              auction_data.get("current_bidder")
-              or auction_data.get("bidder")
-              or status_detail.get("current_bidder")
-              or status_detail.get("highest_bidder")
-          )
-
-          gold_bid = (
-              auction_data.get("current_bid")
-              or auction_data.get("bid")
-              or status_detail.get("current_bid")
-              or status_detail.get("highest_bid")
-              or 0
-          )
-
-          house_name = house_data.get("name") or h.get("name", "N/A")
-
-          # Jeśli licytacja trwa i jest gracz składający ofertę
-          if player_nick and str(player_nick).strip() not in [
-              "",
-              "None",
-              "null",
-              "Brak ofert",
-          ]:
-            print(
-                f"  [+] ZNALEZIONO OFERTĘ: {house_name} ({town}) -> Gracz:"
-                f" {player_nick} | {gold_bid} gp"
-            )
-            bids.append({
-                "Timestamp_UTC": now_str,
-                "House Name": house_name,
-                "Town": town,
-                "Player Nick": str(player_nick).strip(),
-                "Gold Amount": int(gold_bid),
-            })
-    except Exception as e:
-      print(f"[{town}] Błąd: {e}")
+  # Krok 2: Sprawdzamy wszystkie domki równolegle w 20 wątkach
+  with ThreadPoolExecutor(max_workers=20) as executor:
+    futures = [
+        executor.submit(check_single_house, item[0], item[1], now_str)
+        for item in houses_to_check
+    ]
+    for future in as_completed(futures):
+      res = future.result()
+      if res:
+        bids.append(res)
 
   return bids
 
@@ -127,9 +145,9 @@ def main():
 
   if records:
     df_new = pd.DataFrame(records)
-    print(f"\n==========================================")
-    print(f"Sukces! Pobrano {len(df_new)} ofert licytacji.")
-    print(f"==========================================")
+    print(
+        f"\n[+] Sukces! Znaleziono {len(df_new)} ofert z graczami.", flush=True
+    )
 
     if os.path.exists(CSV_FILE):
       df_new.to_csv(
@@ -139,11 +157,12 @@ def main():
       df_new.to_csv(
           CSV_FILE, mode="w", header=True, index=False, encoding="utf-8-sig"
       )
-    print(f"[+] Dane zapisane do {CSV_FILE}.")
+    print(f"[+] Zaktualizowano plik {CSV_FILE}.", flush=True)
   else:
     print(
-        "\n[i] Skrypt zakończył działanie. W tym momencie żaden domek nie ma"
-        " aktywnej oferty gracza."
+        "\n[i] W tym momencie nikt nie złożył nowej oferty na licytowane"
+        " domki.",
+        flush=True,
     )
     if not os.path.exists(CSV_FILE):
       cols = [
