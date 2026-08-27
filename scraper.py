@@ -35,7 +35,7 @@ TOWNS = [
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
-        " like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        " like Gecko) Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json",
     "Cache-Control": "no-cache",
@@ -45,21 +45,21 @@ HEADERS = {
 
 def fetch_town_houses(town):
   town_encoded = urllib.parse.quote(town)
-  url = f"https://api.tibiadata.com/v4/houses/{WORLD}/{town_encoded}?_t={int(time.time() * 1000)}"
+  url = f"https://api.tibiadata.com/v4/houses/{WORLD}/{town_encoded}"
   try:
-    resp = requests.get(url, headers=HEADERS, timeout=10)
+    resp = requests.get(url, headers=HEADERS, timeout=8)
     if resp.status_code == 200:
       data = resp.json().get("houses", {})
-      return (data.get("house_list") or []) + (
-          data.get("guildhall_list") or []
-      )
+      h_list = data.get("house_list") or []
+      g_list = data.get("guildhall_list") or []
+      return h_list + g_list
   except Exception as e:
-    print(f"Błąd pobierania listy dla miasta {town}: {e}", flush=True)
+    print(f"Błąd miasta {town}: {e}", flush=True)
   return []
 
 
-def extract_auction_info(data):
-  """Wyczerpujące wyszukiwanie gracza i kwoty w JSON z TibiaData v4."""
+def parse_auction_json(data):
+  """Wyczerpujące wyszukiwanie gracza i kwoty w JSON z TibiaData."""
   bidder = None
   bid = 0
 
@@ -72,7 +72,7 @@ def extract_auction_info(data):
       or {}
   )
 
-  # 1. Sprawdzamy wszystkie potencjalne pola nicku
+  # Sprawdzanie nicku gracza
   candidates_nick = [
       auction_obj.get("current_bidder"),
       auction_obj.get("highest_bidder"),
@@ -95,7 +95,7 @@ def extract_auction_info(data):
       bidder = str(c).strip()
       break
 
-  # 2. Sprawdzamy wszystkie potencjalne pola kwoty złota
+  # Sprawdzanie kwoty złota
   candidates_gold = [
       auction_obj.get("current_bid"),
       auction_obj.get("highest_bid"),
@@ -122,14 +122,19 @@ def check_single_house(house_id, house_name, town, now_str):
     return None
 
   try:
-    detail_url = f"https://api.tibiadata.com/v4/house/{WORLD}/{house_id}?_t={int(time.time() * 1000)}"
+    detail_url = f"https://api.tibiadata.com/v4/house/{WORLD}/{house_id}"
     resp = requests.get(detail_url, headers=HEADERS, timeout=6)
 
     if resp.status_code == 200:
       data = resp.json()
-      bidder, gold_bid = extract_auction_info(data)
+      bidder, gold_bid = parse_auction_json(data)
 
       if bidder and gold_bid > 0:
+        print(
+            f"  [+] Znaleziono: {house_name} ({town}) -> {bidder} ({gold_bid}"
+            " gp)",
+            flush=True,
+        )
         return {
             "Timestamp_UTC": now_str,
             "House Name": house_name,
@@ -137,19 +142,18 @@ def check_single_house(house_id, house_name, town, now_str):
             "Player Nick": bidder,
             "Gold Amount": gold_bid,
         }
-  except Exception:
-    pass
+  except Exception as e:
+    print(f"Błąd domku {house_id}: {e}", flush=True)
   return None
 
 
 def get_all_active_auctions(now_str):
-  """Wyszukuje wszystkie licytowane domki na całej Antice."""
   houses_to_check = []
   for town in TOWNS:
     houses = fetch_town_houses(town)
     for h in houses:
       status = str(h.get("status", "")).lower()
-      # Sprawdzamy każdy domek, który nie jest w 100% zamkniętym wynajmem bez aukcji
+      # Sprawdzamy każdy domek, który nie jest w 100% wynajęty bez licytacji
       if "rented" not in status or "auction" in status:
         h_id = h.get("house_id")
         h_name = str(h.get("name", "N/A")).strip().strip('"')
@@ -157,11 +161,11 @@ def get_all_active_auctions(now_str):
           houses_to_check.append((h_id, h_name, town))
 
   print(
-      f"Znaleziono {len(houses_to_check)} licytacji do weryfikacji.", flush=True
+      f"Liczba domków do sprawdzenia w API: {len(houses_to_check)}", flush=True
   )
 
   bids = []
-  with ThreadPoolExecutor(max_workers=25) as executor:
+  with ThreadPoolExecutor(max_workers=20) as executor:
     futures = [
         executor.submit(check_single_house, item[0], item[1], item[2], now_str)
         for item in houses_to_check
@@ -174,7 +178,7 @@ def get_all_active_auctions(now_str):
 
 
 def get_last_known_bids():
-  """Czyta historię z CSV i tworzy mapę: (domek, miasto) -> (gracz, kwota)."""
+  """Zwraca słownik: klucz (nazwa_domku, miasto) -> (gracz, kwota) dla OSTATNIEGO wpisu."""
   if not os.path.exists(CSV_FILE):
     return {}
   try:
@@ -193,7 +197,8 @@ def get_last_known_bids():
         gold = 0
 
       key = (h_name, town)
-      if key not in state or gold > state[key][1]:
+      # Zapamiętujemy stan
+      if key not in state:
         state[key] = (nick, gold)
 
     return state
@@ -202,7 +207,6 @@ def get_last_known_bids():
 
 
 def append_and_clean_csv(new_records):
-  """Dopisuje nowe oferty na górę i zachowuje historię do 14 dni."""
   cols = ["Timestamp_UTC", "House Name", "Town", "Player Nick", "Gold Amount"]
 
   if os.path.exists(CSV_FILE):
@@ -222,12 +226,6 @@ def append_and_clean_csv(new_records):
   if df_combined.empty:
     return
 
-  # Usuwanie ewentualnych ścisłych duplikatów
-  df_combined = df_combined.drop_duplicates(
-      subset=["Timestamp_UTC", "House Name", "Town", "Gold Amount"]
-  )
-
-  # Usuwanie rekordów starszych niż 14 dni
   df_combined["_dt"] = pd.to_datetime(
       df_combined["Timestamp_UTC"], errors="coerce"
   )
@@ -237,14 +235,13 @@ def append_and_clean_csv(new_records):
   df_cleaned = df_cleaned.sort_values(by="_dt", ascending=False)
   df_cleaned = df_cleaned[cols]
 
-  # Zapis z pełnym cytowaniem znaków dla bezpieczeństwa przecinków w nazwach
+  # Bezpieczny zapis z cudzysłowami
   df_cleaned.to_csv(
-      CSV_FILE, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_NONNUMERIC
+      CSV_FILE, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_MINIMAL
   )
 
 
 def is_sniper_time(now_utc):
-  # Obsługuje czas letni CEST (07:55 - 08:02 UTC) oraz zimowy CET (08:55 - 09:02 UTC)
   summer = (now_utc.hour == 7 and now_utc.minute >= 55) or (
       now_utc.hour == 8 and now_utc.minute <= 2
   )
@@ -259,16 +256,17 @@ def main():
   now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
   last_bids = get_last_known_bids()
 
-  if is_sniper_time(now_utc):
-    print("=== START TRYBU TURBO-SNAJPER (09:55 - 10:02 EU) ===", flush=True)
-    start_t = time.time()
+  print(f"--- Skanowanie licytacji: {now_str} UTC ---", flush=True)
 
+  if is_sniper_time(now_utc):
+    print("=== TRYB TURBO-SNAJPER (09:55 - 10:02 EU) ===", flush=True)
+    start_t = time.time()
     while time.time() - start_t < 420:
       curr = datetime.utcnow()
       if (curr.hour == 8 and curr.minute >= 2) or (
           curr.hour == 9 and curr.minute >= 2
       ):
-        print("Server Save zakończony. Zamykam snajpera.", flush=True)
+        print("Koniec Server Save. Zamykam snajpera.", flush=True)
         break
 
       curr_str = curr.strftime("%Y-%m-%d %H:%M:%S")
@@ -277,11 +275,10 @@ def main():
 
       for b in active_bids:
         key = (b["House Name"].lower(), b["Town"].lower())
-        if key not in last_bids or last_bids[key] != (
-            b["Player Nick"],
-            b["Gold Amount"],
-        ):
-          last_bids[key] = (b["Player Nick"], b["Gold Amount"])
+        current_tuple = (b["Player Nick"], b["Gold Amount"])
+
+        if key not in last_bids or last_bids[key] != current_tuple:
+          last_bids[key] = current_tuple
           new_to_save.append(b)
           print(
               f"[{b['Timestamp_UTC']}] PRZEBICIE: {b['House Name']} ->"
@@ -292,26 +289,24 @@ def main():
       if new_to_save:
         append_and_clean_csv(new_to_save)
 
-      # W krytycznej minucie 09:59 - 10:01 odpytujemy co 1s
       is_critical = (curr.hour in [7, 8] and curr.minute == 59) or (
           curr.hour in [8, 9] and curr.minute == 0
       )
       time.sleep(1 if is_critical else 2)
   else:
-    print("=== Standardowe sprawdzenie (co 15 minut) ===", flush=True)
+    print("=== Sprawdzenie okresowe ===", flush=True)
     active_bids = get_all_active_auctions(now_str)
     new_to_save = []
 
     for b in active_bids:
       key = (b["House Name"].lower(), b["Town"].lower())
-      if key not in last_bids or last_bids[key] != (
-          b["Player Nick"],
-          b["Gold Amount"],
-      ):
-        last_bids[key] = (b["Player Nick"], b["Gold Amount"])
+      current_tuple = (b["Player Nick"], b["Gold Amount"])
+
+      if key not in last_bids or last_bids[key] != current_tuple:
+        last_bids[key] = current_tuple
         new_to_save.append(b)
         print(
-            f"  [+] NOWA OFERTA: {b['House Name']} ({b['Town']}) ->"
+            f"  [+] NOWA ZMIANA: {b['House Name']} ({b['Town']}) ->"
             f" {b['Player Nick']} ({b['Gold Amount']} gp)",
             flush=True,
         )
@@ -320,7 +315,7 @@ def main():
     if new_to_save:
       print(f"Pomyślnie dopisano {len(new_to_save)} nowych ofert.", flush=True)
     else:
-      print("Brak zmian w licytacjach od ostatniego sprawdzenia.", flush=True)
+      print("Brak nowych zmian w licytacjach.", flush=True)
 
 
 if __name__ == "__main__":
