@@ -1,7 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
 from datetime import datetime, timedelta
-import json
 import os
+import re
 import time
 import urllib.parse
 import pandas as pd
@@ -9,7 +10,7 @@ import requests
 
 WORLD = "Antica"
 CSV_FILE = "historia_licytacji.csv"
-DAYS_TO_KEEP = 7
+DAYS_TO_KEEP = 14
 
 TOWNS = [
     "Ab'Dendriel",
@@ -32,7 +33,11 @@ TOWNS = [
 ]
 
 HEADERS = {
-    "User-Agent": "TibiaAuctionTracker/2.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,"
+        " like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
 }
@@ -40,54 +45,74 @@ HEADERS = {
 
 def fetch_town_houses(town):
   town_encoded = urllib.parse.quote(town)
-  url = f"https://api.tibiadata.com/v4/houses/{WORLD}/{town_encoded}?_t={int(time.time())}"
+  url = f"https://api.tibiadata.com/v4/houses/{WORLD}/{town_encoded}?_t={int(time.time() * 1000)}"
   try:
-    resp = requests.get(url, headers=HEADERS, timeout=8)
+    resp = requests.get(url, headers=HEADERS, timeout=10)
     if resp.status_code == 200:
       data = resp.json().get("houses", {})
       return (data.get("house_list") or []) + (
           data.get("guildhall_list") or []
       )
-  except Exception:
-    pass
+  except Exception as e:
+    print(f"Błąd pobierania listy dla miasta {town}: {e}", flush=True)
   return []
 
 
-def parse_auction_data(data):
-  """Pancerne wyciąganie danych o licytacji z każdego możliwego miejsca w JSON."""
+def extract_auction_info(data):
+  """Wyczerpujące wyszukiwanie gracza i kwoty w JSON z TibiaData v4."""
+  bidder = None
+  bid = 0
+
   house = data.get("house", {})
-
-  # Szukamy obiektu auction
-  auction = house.get("auction") or house.get("status", {}).get("auction") or {}
-
-  bidder = (
-      auction.get("current_bidder")
-      or auction.get("highest_bidder")
-      or auction.get("bidder")
-      or auction.get("character")
-      or house.get("status", {}).get("current_bidder")
-      or house.get("status", {}).get("highest_bidder")
+  status_obj = house.get("status", {})
+  auction_obj = (
+      house.get("auction")
+      or status_obj.get("auction")
+      or data.get("auction")
+      or {}
   )
 
-  bid = (
-      auction.get("current_bid")
-      or auction.get("highest_bid")
-      or auction.get("bid")
-      or house.get("status", {}).get("current_bid")
-      or house.get("status", {}).get("highest_bid")
-      or 0
-  )
+  # 1. Sprawdzamy wszystkie potencjalne pola nicku
+  candidates_nick = [
+      auction_obj.get("current_bidder"),
+      auction_obj.get("highest_bidder"),
+      auction_obj.get("bidder"),
+      status_obj.get("current_bidder"),
+      status_obj.get("highest_bidder"),
+      status_obj.get("bidder"),
+      house.get("highest_bidder"),
+      house.get("bidder"),
+  ]
+  for c in candidates_nick:
+    if c and str(c).strip().lower() not in [
+        "",
+        "none",
+        "null",
+        "false",
+        "brak ofert",
+        "no bidder",
+    ]:
+      bidder = str(c).strip()
+      break
 
-  # Czyszczenie wartości
-  if bidder:
-    bidder = str(bidder).strip()
-    if bidder.lower() in ["", "none", "null", "brak ofert", "false"]:
-      bidder = None
-
-  try:
-    bid = int(str(bid).replace(",", "").replace(".", "").strip())
-  except Exception:
-    bid = 0
+  # 2. Sprawdzamy wszystkie potencjalne pola kwoty złota
+  candidates_gold = [
+      auction_obj.get("current_bid"),
+      auction_obj.get("highest_bid"),
+      auction_obj.get("bid"),
+      status_obj.get("current_bid"),
+      status_obj.get("highest_bid"),
+      status_obj.get("bid"),
+      house.get("highest_bid"),
+      house.get("bid"),
+  ]
+  for g in candidates_gold:
+    if g is not None:
+      clean_num = re.sub(r"[^\d]", "", str(g))
+      if clean_num:
+        val = int(clean_num)
+        if val > bid:
+          bid = val
 
   return bidder, bid
 
@@ -98,11 +123,11 @@ def check_single_house(house_id, house_name, town, now_str):
 
   try:
     detail_url = f"https://api.tibiadata.com/v4/house/{WORLD}/{house_id}?_t={int(time.time() * 1000)}"
-    resp = requests.get(detail_url, headers=HEADERS, timeout=4)
+    resp = requests.get(detail_url, headers=HEADERS, timeout=6)
 
     if resp.status_code == 200:
       data = resp.json()
-      bidder, gold_bid = parse_auction_data(data)
+      bidder, gold_bid = extract_auction_info(data)
 
       if bidder and gold_bid > 0:
         return {
@@ -117,33 +142,29 @@ def check_single_house(house_id, house_name, town, now_str):
   return None
 
 
-def build_hotlist():
-  hotlist = []
+def get_all_active_auctions(now_str):
+  """Wyszukuje wszystkie licytowane domki na całej Antice."""
+  houses_to_check = []
   for town in TOWNS:
     houses = fetch_town_houses(town)
     for h in houses:
       status = str(h.get("status", "")).lower()
-      # Sprawdzamy wszystko poza w 100% bezpiecznie wynajętymi bez licytacji
+      # Sprawdzamy każdy domek, który nie jest w 100% zamkniętym wynajmem bez aukcji
       if "rented" not in status or "auction" in status:
         h_id = h.get("house_id")
         h_name = str(h.get("name", "N/A")).strip().strip('"')
         if h_id:
-          hotlist.append({"id": h_id, "name": h_name, "town": town})
-  return hotlist
+          houses_to_check.append((h_id, h_name, town))
 
+  print(
+      f"Znaleziono {len(houses_to_check)} licytacji do weryfikacji.", flush=True
+  )
 
-def scan_hotlist(hotlist, now_str):
   bids = []
-  with ThreadPoolExecutor(max_workers=30) as executor:
+  with ThreadPoolExecutor(max_workers=25) as executor:
     futures = [
-        executor.submit(
-            check_single_house,
-            item["id"],
-            item["name"],
-            item["town"],
-            now_str,
-        )
-        for item in hotlist
+        executor.submit(check_single_house, item[0], item[1], item[2], now_str)
+        for item in houses_to_check
     ]
     for future in as_completed(futures):
       res = future.result()
@@ -152,7 +173,8 @@ def scan_hotlist(hotlist, now_str):
   return bids
 
 
-def get_last_known_state():
+def get_last_known_bids():
+  """Czyta historię z CSV i tworzy mapę: (domek, miasto) -> (gracz, kwota)."""
   if not os.path.exists(CSV_FILE):
     return {}
   try:
@@ -160,28 +182,27 @@ def get_last_known_state():
     if df.empty or "House Name" not in df.columns:
       return {}
 
-    df["dt"] = pd.to_datetime(df["Timestamp_UTC"], errors="coerce")
-    df = df.sort_values(by="dt", ascending=True)
-
-    last_state = {}
+    state = {}
     for _, row in df.iterrows():
-      h_name = str(row["House Name"]).strip().strip('"')
-      town = str(row["Town"]).strip()
+      h_name = str(row["House Name"]).strip().lower()
+      town = str(row["Town"]).strip().lower()
       nick = str(row["Player Nick"]).strip()
       try:
         gold = int(row["Gold Amount"])
-      except (ValueError, TypeError):
+      except Exception:
         gold = 0
 
-      key = (h_name.lower(), town.lower())
-      last_state[key] = (nick, gold)
+      key = (h_name, town)
+      if key not in state or gold > state[key][1]:
+        state[key] = (nick, gold)
 
-    return last_state
+    return state
   except Exception:
     return {}
 
 
-def update_and_cleanup_csv(new_records):
+def append_and_clean_csv(new_records):
+  """Dopisuje nowe oferty na górę i zachowuje historię do 14 dni."""
   cols = ["Timestamp_UTC", "House Name", "Town", "Player Nick", "Gold Amount"]
 
   if os.path.exists(CSV_FILE):
@@ -201,102 +222,105 @@ def update_and_cleanup_csv(new_records):
   if df_combined.empty:
     return
 
+  # Usuwanie ewentualnych ścisłych duplikatów
+  df_combined = df_combined.drop_duplicates(
+      subset=["Timestamp_UTC", "House Name", "Town", "Gold Amount"]
+  )
+
+  # Usuwanie rekordów starszych niż 14 dni
   df_combined["_dt"] = pd.to_datetime(
       df_combined["Timestamp_UTC"], errors="coerce"
   )
-  cutoff_date = datetime.utcnow() - timedelta(days=DAYS_TO_KEEP)
-  df_cleaned = df_combined[df_combined["_dt"] >= cutoff_date]
-
-  # Usuwanie ewentualnych duplikatów
-  df_cleaned = df_cleaned.drop_duplicates(
-      subset=["House Name", "Town", "Player Nick", "Gold Amount"]
-  )
+  cutoff = datetime.utcnow() - timedelta(days=DAYS_TO_KEEP)
+  df_cleaned = df_combined[df_combined["_dt"] >= cutoff].copy()
 
   df_cleaned = df_cleaned.sort_values(by="_dt", ascending=False)
   df_cleaned = df_cleaned[cols]
 
-  df_cleaned.to_csv(CSV_FILE, index=False, encoding="utf-8-sig")
+  # Zapis z pełnym cytowaniem znaków dla bezpieczeństwa przecinków w nazwach
+  df_cleaned.to_csv(
+      CSV_FILE, index=False, encoding="utf-8-sig", quoting=csv.QUOTE_NONNUMERIC
+  )
 
 
-def is_sniper_active(now_utc):
-  in_summer = (now_utc.hour == 7 and now_utc.minute >= 55) or (
+def is_sniper_time(now_utc):
+  # Obsługuje czas letni CEST (07:55 - 08:02 UTC) oraz zimowy CET (08:55 - 09:02 UTC)
+  summer = (now_utc.hour == 7 and now_utc.minute >= 55) or (
       now_utc.hour == 8 and now_utc.minute <= 2
   )
-  in_winter = (now_utc.hour == 8 and now_utc.minute >= 55) or (
+  winter = (now_utc.hour == 8 and now_utc.minute >= 55) or (
       now_utc.hour == 9 and now_utc.minute <= 2
   )
-  return in_summer or in_winter
+  return summer or winter
 
 
 def main():
   now_utc = datetime.utcnow()
-  last_known_state = get_last_known_state()
+  now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+  last_bids = get_last_known_bids()
 
-  if is_sniper_active(now_utc):
-    print("=== TRYB TURBO-SNAJPERA: Okno 09:55 - 10:02 EU ===", flush=True)
-    hotlist = build_hotlist()
-    print(f"Obserwowane domki ({len(hotlist)}):", flush=True)
-    for item in hotlist:
-      print(f" -> {item['name']} ({item['town']})", flush=True)
+  if is_sniper_time(now_utc):
+    print("=== START TRYBU TURBO-SNAJPER (09:55 - 10:02 EU) ===", flush=True)
+    start_t = time.time()
 
-    start_time = time.time()
-    while time.time() - start_time < 420:
-      current_utc = datetime.utcnow()
-      if (current_utc.hour == 8 and current_utc.minute >= 2) or (
-          current_utc.hour == 9 and current_utc.minute >= 2
+    while time.time() - start_t < 420:
+      curr = datetime.utcnow()
+      if (curr.hour == 8 and curr.minute >= 2) or (
+          curr.hour == 9 and curr.minute >= 2
       ):
-        print("Koniec Server Save. Zamykam snajpera.", flush=True)
+        print("Server Save zakończony. Zamykam snajpera.", flush=True)
         break
 
-      now_str = current_utc.strftime("%Y-%m-%d %H:%M:%S")
-      records = scan_hotlist(hotlist, now_str)
-      updates = []
+      curr_str = curr.strftime("%Y-%m-%d %H:%M:%S")
+      active_bids = get_all_active_auctions(curr_str)
+      new_to_save = []
 
-      for r in records:
-        key = (r["House Name"].lower(), r["Town"].lower())
-        current_state = (r["Player Nick"], r["Gold Amount"])
-
-        if key not in last_known_state or last_known_state[key] != current_state:
-          last_known_state[key] = current_state
-          updates.append(r)
+      for b in active_bids:
+        key = (b["House Name"].lower(), b["Town"].lower())
+        if key not in last_bids or last_bids[key] != (
+            b["Player Nick"],
+            b["Gold Amount"],
+        ):
+          last_bids[key] = (b["Player Nick"], b["Gold Amount"])
+          new_to_save.append(b)
           print(
-              f"[{r['Timestamp_UTC']}] PRZEBICIE: {r['House Name']} ->"
-              f" {r['Player Nick']} ({r['Gold Amount']} gp)",
+              f"[{b['Timestamp_UTC']}] PRZEBICIE: {b['House Name']} ->"
+              f" {b['Player Nick']} ({b['Gold Amount']} gp)",
               flush=True,
           )
 
-      if updates:
-        update_and_cleanup_csv(updates)
+      if new_to_save:
+        append_and_clean_csv(new_to_save)
 
-      is_critical = (
-          current_utc.hour in [7, 8] and current_utc.minute == 59
-      ) or (current_utc.hour in [8, 9] and current_utc.minute == 0)
+      # W krytycznej minucie 09:59 - 10:01 odpytujemy co 1s
+      is_critical = (curr.hour in [7, 8] and curr.minute == 59) or (
+          curr.hour in [8, 9] and curr.minute == 0
+      )
       time.sleep(1 if is_critical else 2)
-
   else:
-    print("=== Sprawdzenie okresowe (co 15 minut) ===", flush=True)
-    hotlist = build_hotlist()
-    records = scan_hotlist(hotlist, now_utc.strftime("%Y-%m-%d %H:%M:%S"))
-    updates = []
+    print("=== Standardowe sprawdzenie (co 15 minut) ===", flush=True)
+    active_bids = get_all_active_auctions(now_str)
+    new_to_save = []
 
-    for r in records:
-      key = (r["House Name"].lower(), r["Town"].lower())
-      current_state = (r["Player Nick"], r["Gold Amount"])
-
-      if key not in last_known_state or last_known_state[key] != current_state:
-        last_known_state[key] = current_state
-        updates.append(r)
+    for b in active_bids:
+      key = (b["House Name"].lower(), b["Town"].lower())
+      if key not in last_bids or last_bids[key] != (
+          b["Player Nick"],
+          b["Gold Amount"],
+      ):
+        last_bids[key] = (b["Player Nick"], b["Gold Amount"])
+        new_to_save.append(b)
         print(
-            f"  [+] AKTUALIZACJA: {r['House Name']} ({r['Town']}) ->"
-            f" {r['Player Nick']} ({r['Gold Amount']} gp)",
+            f"  [+] NOWA OFERTA: {b['House Name']} ({b['Town']}) ->"
+            f" {b['Player Nick']} ({b['Gold Amount']} gp)",
             flush=True,
         )
 
-    update_and_cleanup_csv(updates)
-    if updates:
-      print(f"Zapisano {len(updates)} nowych rekordów.", flush=True)
+    append_and_clean_csv(new_to_save)
+    if new_to_save:
+      print(f"Pomyślnie dopisano {len(new_to_save)} nowych ofert.", flush=True)
     else:
-      print("Brak nowych zmian w licytacjach.", flush=True)
+      print("Brak zmian w licytacjach od ostatniego sprawdzenia.", flush=True)
 
 
 if __name__ == "__main__":
