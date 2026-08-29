@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 from datetime import datetime, timedelta
 import html
@@ -5,7 +6,6 @@ import os
 import re
 import time
 import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
 
@@ -60,7 +60,6 @@ def fetch_town_houses_list(town):
 
 
 def extract_from_json(house_id):
-  """Zapasowe pobranie z JSON w razie braku dopasowania w HTML."""
   try:
     url = f"https://api.tibiadata.com/v4/house/{WORLD}/{house_id}"
     resp = requests.get(url, headers=HEADERS, timeout=4)
@@ -116,16 +115,15 @@ def check_house(house_id, house_name, town, now_str):
   if not house_id:
     return None
 
-  # Metoda 1: Bezpośrednio Tibia.com HTML
   url = f"https://www.tibia.com/community/?subtopic=houses&page=view&world={WORLD}&houseid={house_id}"
   try:
     resp = requests.get(url, headers=HEADERS, timeout=4)
     if resp.status_code == 200:
       text = html.unescape(resp.text)
 
-      # Wyszukiwanie kwoty
+      # Wyszukiwanie kwoty (zarówno trwającej, jak i zakończonej aukcji)
       bids = re.findall(
-          r"(?:highest bid|current bid|bid so far is|auctioned.*?is)\s*[:]?\s*<b>?([\d,.]+)\s*gold",
+          r"(?:highest bid|current bid|bid so far is|auctioned.*?is|has ended at.*?bid so far is)\s*[:]?\s*<b>?([\d,.]+)\s*gold",
           text,
           re.IGNORECASE,
       )
@@ -154,11 +152,9 @@ def check_house(house_id, house_name, town, now_str):
       if bids and nicks:
         gold_str = re.sub(r"[^\d]", "", bids[0])
         bidder = nicks[0].strip()
+        bidder = re.sub(r"<[^>]*>", "", bidder).strip()
+
         if bidder and gold_str and int(gold_str) > 0:
-          print(
-              f"  [HTML HIT] {house_name} -> {bidder} ({gold_str} gp)",
-              flush=True,
-          )
           return {
               "Timestamp_UTC": now_str,
               "House Name": house_name,
@@ -169,10 +165,9 @@ def check_house(house_id, house_name, town, now_str):
   except Exception:
     pass
 
-  # Metoda 2: Fallback do JSON API
+  # Fallback do JSON API
   bidder, gold = extract_from_json(house_id)
   if bidder and gold > 0:
-    print(f"  [JSON HIT] {house_name} -> {bidder} ({gold} gp)", flush=True)
     return {
         "Timestamp_UTC": now_str,
         "House Name": house_name,
@@ -201,7 +196,6 @@ def get_active_houses():
         if h_id:
           candidates.append((h_id, h_name, town))
 
-  # Gwarancja monitoringu Alai Flats
   if not any("Alai Flats" in str(c[1]) for c in candidates):
     candidates.append((10204, "Alai Flats, Flat 25", "Thais"))
 
@@ -284,10 +278,10 @@ def append_and_clean_csv(new_records):
 
 def is_sniper_time(now_utc):
   summer = (now_utc.hour == 7 and now_utc.minute >= 55) or (
-      now_utc.hour == 8 and now_utc.minute <= 2
+      now_utc.hour == 8 and now_utc.minute <= 10
   )
   winter = (now_utc.hour == 8 and now_utc.minute >= 55) or (
-      now_utc.hour == 9 and now_utc.minute <= 2
+      now_utc.hour == 9 and now_utc.minute <= 10
   )
   return summer or winter
 
@@ -297,21 +291,19 @@ def main():
   now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
   last_bids = get_last_known_bids()
 
-  print(f"=== Skaner Aukcji: {now_str} UTC ===", flush=True)
+  print(f"=== Skaner: {now_str} UTC ===", flush=True)
   houses_to_track = get_active_houses()
-  print(f"Śledzone domki ({len(houses_to_track)}):", flush=True)
-  for h in houses_to_track:
-    print(f" -> {h[1]} ({h[2]})", flush=True)
 
   if is_sniper_time(now_utc):
-    print("=== TRYB TURBO-SNAJPER (09:55 - 10:02 EU) ===", flush=True)
+    print("=== TRYB TURBO-SNAJPER (09:55 - 10:10 EU) ===", flush=True)
     start_t = time.time()
-    while time.time() - start_t < 420:
+    # Pętla działa do 10:10 CEST (maks. 900 sekund)
+    while time.time() - start_t < 900:
       curr = datetime.utcnow()
-      if (curr.hour == 8 and curr.minute >= 2) or (
-          curr.hour == 9 and curr.minute >= 2
+      if (curr.hour == 8 and curr.minute >= 10) or (
+          curr.hour == 9 and curr.minute >= 10
       ):
-        print("Server Save zakończony. Zamykam snajpera.", flush=True)
+        print("Server Save oraz weryfikacja bazy zakończona.", flush=True)
         break
 
       curr_str = curr.strftime("%Y-%m-%d %H:%M:%S")
@@ -326,7 +318,7 @@ def main():
           last_bids[key] = curr_state
           new_to_save.append(b)
           print(
-              f"[{b['Timestamp_UTC']}] PRZEBICIE: {b['House Name']} ->"
+              f"[{b['Timestamp_UTC']}] FINALNE PRZEBICIE: {b['House Name']} ->"
               f" {b['Player Nick']} ({b['Gold Amount']} gp)",
               flush=True,
           )
@@ -334,10 +326,10 @@ def main():
       if new_to_save:
         append_and_clean_csv(new_to_save)
 
-      is_critical = (curr.hour in [7, 8] and curr.minute == 59) or (
-          curr.hour in [8, 9] and curr.minute == 0
+      is_critical = (curr.hour in [7, 8] and curr.minute >= 59) or (
+          curr.hour in [8, 9] and curr.minute <= 2
       )
-      time.sleep(1 if is_critical else 2)
+      time.sleep(1 if is_critical else 3)
   else:
     print("=== Standardowe sprawdzenie ===", flush=True)
     active_bids = scan_all_targets(houses_to_track, now_str)
@@ -351,17 +343,14 @@ def main():
         last_bids[key] = curr_state
         new_to_save.append(b)
         print(
-            f"  [+] NOWY WPIS: {b['House Name']} ({b['Town']}) ->"
+            f"  [+] ZNALEZIONO OFERTĘ: {b['House Name']} ({b['Town']}) ->"
             f" {b['Player Nick']} ({b['Gold Amount']} gp)",
             flush=True,
         )
 
     if new_to_save:
       append_and_clean_csv(new_to_save)
-      print(
-          f"Pomyślnie zapisano {len(new_to_save)} nowych rekordów do CSV.",
-          flush=True,
-      )
+      print(f"Pomyślnie zapisano {len(new_to_save)} rekordów do CSV.", flush=True)
     else:
       print("Brak nowych zmian w licytacjach.", flush=True)
 
